@@ -42,7 +42,26 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/HealthResponse'
  */
+
+// Short in-memory cache (issue #1511): bursts of probes within the TTL reuse the
+// previous result instead of re-running the DB / Redis / RPC checks. Disabled
+// under NODE_ENV=test unless HEALTH_CACHE_TTL_MS is set explicitly.
+const HEALTH_CACHE_TTL_MS = Number(
+  process.env.HEALTH_CACHE_TTL_MS ?? (process.env.NODE_ENV === 'test' ? 0 : 2000),
+);
+let healthCache: { expiresAt: number; statusCode: number; body: unknown } | null = null;
+
+/** Clears the cached health result (used by tests). */
+export function resetHealthCache(): void {
+  healthCache = null;
+}
+
 router.get('/', async (_req: Request, res: Response) => {
+  if (healthCache && Date.now() < healthCache.expiresAt) {
+    res.status(healthCache.statusCode).json(healthCache.body);
+    return;
+  }
+
   let dbStatus = 'connected';
   try {
     await prisma.$queryRaw`SELECT 1`;
@@ -111,7 +130,8 @@ router.get('/', async (_req: Request, res: Response) => {
   // taken between poll cycles still reflects the ledger the indexer reached.
   setIndexerLedgers(state?.lastLedger ?? 0, networkLedger);
 
-  res.status(isHealthy ? 200 : 503).json({
+  const statusCode = isHealthy ? 200 : 503;
+  const body = {
     status,
     db: dbStatus,
     indexerEnabled,
@@ -141,7 +161,13 @@ router.get('/', async (_req: Request, res: Response) => {
         status: sorobanRpcOk ? 'ok' : 'down',
       },
     },
-  });
+  };
+
+  if (HEALTH_CACHE_TTL_MS > 0) {
+    healthCache = { expiresAt: Date.now() + HEALTH_CACHE_TTL_MS, statusCode, body };
+  }
+  res.status(statusCode).json(body);
+;
 });
 
 export default router;
